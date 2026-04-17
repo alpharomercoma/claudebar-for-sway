@@ -1,8 +1,8 @@
 # ClaudeBar for Sway
 
-A Waybar module that shows your real-time Claude Pro usage — 5-hour window percentage and time until reset — pulled directly from Anthropic's API using your existing Claude Code credentials.
+![ClaudeBar for Sway](assets/claudebar.png)
 
-**Developer:** Alpha Romer Coma
+A Waybar module that shows your real-time Claude Pro usage — 5-hour window percentage and time until reset — pulled directly from Anthropic's API using your existing Claude Code credentials.
 
 ---
 
