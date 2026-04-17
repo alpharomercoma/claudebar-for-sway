@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+import json, os, time, urllib.request, urllib.error
+from datetime import datetime
+
+CREDS = os.path.expanduser("~/.claude/.credentials.json")
+CACHE = os.path.expanduser("~/.cache/claudebar-usage.json")
+API_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def get_token():
+    with open(CREDS) as f:
+        return json.load(f)["claudeAiOauth"]["accessToken"]
+
+
+def fetch_usage(token):
+    req = urllib.request.Request(
+        API_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return json.loads(r.read())
+
+
+def fmt_reset(resets_at_str):
+    try:
+        remaining = datetime.fromisoformat(resets_at_str).timestamp() - time.time()
+        if remaining <= 0:
+            return "↺"
+        h, m = int(remaining // 3600), int((remaining % 3600) // 60)
+        return f"{h}h{m:02d}m" if h else f"{m}m"
+    except Exception:
+        return "--"
+
+
+def load_cache():
+    try:
+        with open(CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_cache(payload):
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    with open(CACHE, "w") as f:
+        json.dump(payload, f)
+
+
+try:
+    data = fetch_usage(get_token())
+    fh = data.get("five_hour") or {}
+    pct = int(fh.get("utilization") or 0)
+    time_str = fmt_reset(fh.get("resets_at") or "")
+    w7 = int((data.get("seven_day") or {}).get("utilization") or 0)
+    payload = {"pct": pct, "time_str": time_str, "w7": w7}
+    save_cache(payload)
+except Exception:
+    payload = load_cache()
+    if payload is None:
+        print(json.dumps({"text": "◆ --", "tooltip": "Waiting for data", "class": "idle"}))
+        raise SystemExit
+
+pct = payload["pct"]
+time_str = payload["time_str"]
+w7 = payload["w7"]
+css_class = "critical" if pct >= 80 else "active"
+
+print(json.dumps({
+    "text": f"◆ {pct}%  {time_str}",
+    "tooltip": f"5h window: {pct}% used, resets in {time_str}\n7d window: {w7}%",
+    "class": css_class,
+}))
