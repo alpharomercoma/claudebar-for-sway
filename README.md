@@ -96,7 +96,7 @@ pkill -SIGUSR2 waybar
 
 ## How it works
 
-The script reads your OAuth access token from `~/.claude/.credentials.json` (written by Claude Code when you sign in) and calls:
+The script reads your OAuth credentials from `~/.claude/.credentials.json` (written by Claude Code when you sign in). If the access token is expired or within 5 minutes of expiring, the script refreshes it itself — using the `refreshToken` in that file against Anthropic's OAuth token endpoint, then writing the rotated tokens back atomically — exactly as Claude Code does on startup. This means the bar stays accurate on its own, without you ever having to launch a `claude` session. It then calls:
 
 ```
 GET https://api.anthropic.com/api/oauth/usage
@@ -131,7 +131,7 @@ python3 ~/.config/waybar/scripts/claude-usage
 ```
 
 **Token expired**
-Claude Code refreshes the token automatically when you run it. Start a Claude Code session and the token in `~/.claude/.credentials.json` will be updated. The bar will recover on the next 30-second poll.
+The script refreshes the access token on its own whenever it's expired or about to expire, so this should resolve automatically within one 30-second poll. If it persists, your `refreshToken` may be invalid (e.g. you signed out) — run `claude` once to re-authenticate, which rewrites `~/.claude/.credentials.json`.
 
 **Waybar not picking up changes**
 ```bash

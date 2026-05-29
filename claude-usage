@@ -5,11 +5,70 @@ from datetime import datetime
 CREDS = os.path.expanduser("~/.claude/.credentials.json")
 CACHE = os.path.expanduser("~/.cache/claudebar-usage.json")
 API_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+# Claude Code's public OAuth client id (same client that wrote .credentials.json).
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Anthropic's edge rejects urllib's default User-Agent, so identify as the CLI client.
+USER_AGENT = "claude-cli/oauth (claudebar-for-sway)"
+# Refresh a little before the token actually expires so we never serve a stale read.
+REFRESH_SKEW = 300  # seconds
+
+
+def load_creds():
+    with open(CREDS) as f:
+        return json.load(f)
+
+
+def save_creds(data):
+    tmp = CREDS + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, CREDS)
+
+
+def refresh_token(data):
+    """Exchange the refresh token for a fresh access token and persist the
+    rotated credentials. Mirrors what Claude Code does on startup."""
+    o = data["claudeAiOauth"]
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": o["refreshToken"],
+        "client_id": CLIENT_ID,
+    }).encode()
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        resp = json.loads(r.read())
+    o["accessToken"] = resp["access_token"]
+    if resp.get("refresh_token"):
+        o["refreshToken"] = resp["refresh_token"]
+    if resp.get("expires_in"):
+        o["expiresAt"] = int((time.time() + resp["expires_in"]) * 1000)
+    save_creds(data)
+    return o["accessToken"]
 
 
 def get_token():
-    with open(CREDS) as f:
-        return json.load(f)["claudeAiOauth"]["accessToken"]
+    """Return a valid access token, refreshing first if it's expired or close
+    to expiring. Falls back to the existing token if refresh fails."""
+    data = load_creds()
+    o = data["claudeAiOauth"]
+    expires_at = o.get("expiresAt", 0) / 1000
+    if o.get("refreshToken") and time.time() >= expires_at - REFRESH_SKEW:
+        try:
+            return refresh_token(data)
+        except Exception:
+            pass  # fall back to whatever token we have; fetch may still work
+    return o["accessToken"]
 
 
 def fetch_usage(token):
@@ -22,6 +81,17 @@ def fetch_usage(token):
     )
     with urllib.request.urlopen(req, timeout=8) as r:
         return json.loads(r.read())
+
+
+def fetch_usage_with_refresh():
+    """Fetch usage; if the token is rejected (401), force one refresh and retry."""
+    try:
+        return fetch_usage(get_token())
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        token = refresh_token(load_creds())
+        return fetch_usage(token)
 
 
 def fmt_reset(resets_at_str):
@@ -50,7 +120,7 @@ def save_cache(payload):
 
 
 try:
-    data = fetch_usage(get_token())
+    data = fetch_usage_with_refresh()
     fh = data.get("five_hour") or {}
     pct = int(fh.get("utilization") or 0)
     time_str = fmt_reset(fh.get("resets_at") or "")
