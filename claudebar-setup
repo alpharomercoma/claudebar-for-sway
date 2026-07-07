@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Wire the ClaudeBar module into your Waybar setup.
+
+Installs the usage script (git checkouts), adds the module to your Waybar
+config and stylesheet — backing up anything it modifies — then reloads Waybar.
+Safe to re-run: a second invocation changes nothing.
+"""
+import argparse, json, os, re, shutil, subprocess, sys, time
+
+NAME = "claudebar"
+MODULE = "custom/claude"
+USAGE_BIN = "claudebar-usage"
+OLD_BASENAME = "claude-usage"  # pre-rename script name, upgraded in place
+RPM_DATA_DIR = "/usr/share/claudebar"
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+RPM_MODE = HERE == "/usr/bin"
+
+CSS_RULES = [
+    ("#custom-claude", """#custom-claude {
+    padding: 0 10px;
+    background-color: #2b303b;
+    color: #d97757;
+    border-left: 2px solid #d97757;
+}"""),
+    ("#custom-claude.idle", """#custom-claude.idle {
+    color: #666e7a;
+    border-left-color: #666e7a;
+}"""),
+    ("#custom-claude.critical", """#custom-claude.critical {
+    color: #eb4d4b;
+    border-left-color: #eb4d4b;
+}"""),
+    ("#custom-claude.signin", """#custom-claude.signin {
+    color: #f1c40f;
+    border-left-color: #f1c40f;
+}"""),
+]
+
+
+def config_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "waybar")
+
+
+def module_snippet(exec_path):
+    return (
+        f'    "{MODULE}": {{\n'
+        f'        "exec": "{exec_path}",\n'
+        f'        "return-type": "json",\n'
+        f'        "interval": 30,\n'
+        f'        "format": "{{}}",\n'
+        f'        "tooltip": true\n'
+        f'    }}'
+    )
+
+
+def strip_jsonc(text):
+    """Remove // and /* */ comments without touching string contents."""
+    out = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+        elif ch == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif ch == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def atomic_write(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def backup(path):
+    bak = f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    shutil.copy2(path, bak)
+    print(f"  backup: {bak}")
+    return bak
+
+
+def print_manual_help(exec_path):
+    print(f"""
+Add the module by hand instead:
+
+1. In your Waybar config, add "{MODULE}" to "modules-right", and add:
+
+{module_snippet(exec_path)}
+
+2. Append to your Waybar style.css:
+""", file=sys.stderr)
+    for _, block in CSS_RULES:
+        print(block + "\n", file=sys.stderr)
+    print("3. Reload Waybar:  pkill -SIGUSR2 waybar", file=sys.stderr)
+
+
+def refuse(cfg_path, exec_path, why):
+    print(f"error: not touching {cfg_path}: {why}", file=sys.stderr)
+    print_manual_help(exec_path)
+    sys.exit(1)
+
+
+def ensure_script():
+    """Git checkouts: copy the usage script next to the user's Waybar config.
+    RPM installs run it from /usr/bin and skip this."""
+    if RPM_MODE:
+        return False, f"usage script: /usr/bin/{USAGE_BIN} (rpm)"
+    src = os.path.join(HERE, USAGE_BIN)
+    if not os.path.isfile(src):
+        print(f"error: {src} not found — run this from the repo checkout", file=sys.stderr)
+        sys.exit(1)
+    dest_dir = os.path.join(config_dir(), "scripts")
+    dest = os.path.join(dest_dir, USAGE_BIN)
+    with open(src, "rb") as f:
+        content = f.read()
+    if os.path.isfile(dest):
+        with open(dest, "rb") as f:
+            if f.read() == content and os.access(dest, os.X_OK):
+                return False, f"usage script already installed: {dest}"
+    os.makedirs(dest_dir, exist_ok=True)
+    shutil.copy(src, dest)
+    os.chmod(dest, 0o755)
+    return True, f"installed usage script: {dest}"
+
+
+def ensure_config(exec_path, bundle_dir):
+    d = config_dir()
+    cfg_path = None
+    for cand in ("config", "config.jsonc"):  # waybar prefers plain `config`
+        p = os.path.join(d, cand)
+        if os.path.isfile(p):
+            cfg_path = p
+            break
+
+    if cfg_path is None:
+        os.makedirs(d, exist_ok=True)
+        text = open(os.path.join(bundle_dir, "config.jsonc")).read()
+        text = text.replace(f"$HOME/.config/waybar/scripts/{USAGE_BIN}", exec_path)
+        dest = os.path.join(d, "config.jsonc")
+        atomic_write(dest, text)
+        return True, f"installed bundled Waybar config: {dest}"
+
+    raw = open(cfg_path).read()
+    try:
+        cfg = json.loads(strip_jsonc(raw))
+    except ValueError:
+        refuse(cfg_path, exec_path, "could not parse it (even after stripping comments)")
+    if not isinstance(cfg, dict):
+        refuse(cfg_path, exec_path, "multi-bar (array) configs are not supported")
+
+    have_def = MODULE in cfg
+    in_right = MODULE in (cfg.get("modules-right") or [])
+
+    if have_def and in_right:
+        exec_val = (cfg.get(MODULE) or {}).get("exec", "")
+        if exec_val != exec_path and os.path.basename(exec_val) == OLD_BASENAME:
+            backup(cfg_path)
+            edited = raw.replace(f'"{exec_val}"', f'"{exec_path}"', 1)
+            parsed = json.loads(strip_jsonc(edited))  # replace can't break syntax, but verify intent
+            if (parsed.get(MODULE) or {}).get("exec") != exec_path:
+                refuse(cfg_path, exec_path, "could not update the old exec path")
+            atomic_write(cfg_path, edited)
+            return True, f"updated {MODULE} exec path: {exec_val} -> {exec_path}"
+        return False, f"module already configured in {cfg_path}"
+
+    edited = raw
+    if not in_right:
+        m = re.search(r'"modules-right"\s*:\s*\[', edited)
+        if m:
+            j = m.end()
+            k = j
+            while k < len(edited) and edited[k] in " \t\r\n":
+                k += 1
+            empty = k < len(edited) and edited[k] == "]"
+            entry = f'\n        "{MODULE}"'
+            edited = edited[:j] + entry + ("\n    " if empty else ",") + edited[j:]
+        else:
+            m = re.search(r"\{", edited)
+            if m is None:
+                refuse(cfg_path, exec_path, "no root object found")
+            j = m.end()
+            k = j
+            while k < len(edited) and edited[k] in " \t\r\n":
+                k += 1
+            empty = k < len(edited) and edited[k] == "}"
+            key = f'\n    "modules-right": ["{MODULE}"]'
+            edited = edited[:j] + key + ("" if empty else ",") + edited[j:]
+    if not have_def:
+        t = edited.rstrip()
+        if not t.endswith("}"):
+            refuse(cfg_path, exec_path, "config does not end with '}'")
+        body = t[:-1].rstrip()
+        need_comma = bool(body[1:].strip()) and body[-1] not in ",{"
+        edited = body + ("," if need_comma else "") + "\n" + module_snippet(exec_path) + "\n}\n"
+
+    try:
+        parsed = json.loads(strip_jsonc(edited))
+        ok = MODULE in parsed and MODULE in (parsed.get("modules-right") or [])
+    except ValueError:
+        ok = False
+    if not ok:
+        refuse(cfg_path, exec_path, "the edited config did not validate — your file is unchanged")
+    backup(cfg_path)
+    atomic_write(cfg_path, edited)
+    return True, f"added {MODULE} to {cfg_path}"
+
+
+def ensure_css(bundle_dir):
+    d = config_dir()
+    css_path = os.path.join(d, "style.css")
+    if not os.path.isfile(css_path):
+        os.makedirs(d, exist_ok=True)
+        shutil.copy(os.path.join(bundle_dir, "style.css"), css_path)
+        return True, f"installed bundled stylesheet: {css_path}"
+    text = open(css_path).read()
+    missing = [(sel, block) for sel, block in CSS_RULES
+               if not re.search(re.escape(sel) + r"(?![.\w-])\s*[,{]", text)]
+    if not missing:
+        return False, "styles already present"
+    backup(css_path)
+    addition = f"\n/* added by {NAME}-setup */\n" + "\n\n".join(b for _, b in missing) + "\n"
+    atomic_write(css_path, text + addition)
+    return True, f"appended {len(missing)} style rule(s) to {css_path}"
+
+
+def reload_waybar():
+    try:
+        rc = subprocess.run(["pkill", "-SIGUSR2", "-x", "waybar"]).returncode
+    except OSError:
+        rc = -1
+    return "waybar: reloaded" if rc == 0 else "waybar: not running (config is picked up on next start)"
+
+
+def main():
+    argparse.ArgumentParser(description=__doc__).parse_args()
+    if os.geteuid() == 0:
+        print("error: run as your normal user, not root — this edits your own "
+              "Waybar config", file=sys.stderr)
+        sys.exit(1)
+    exec_path = f"/usr/bin/{USAGE_BIN}" if RPM_MODE else \
+        f"$HOME/.config/waybar/scripts/{USAGE_BIN}"
+    bundle_dir = RPM_DATA_DIR if RPM_MODE else HERE
+    if not os.path.isfile(os.path.join(bundle_dir, "config.jsonc")):
+        print(f"error: bundled files not found in {bundle_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    results = [ensure_script(), ensure_config(exec_path, bundle_dir), ensure_css(bundle_dir)]
+    for changed, msg in results:
+        print(("* " if changed else "  ") + msg)
+    if any(changed for changed, _ in results):
+        print("  " + reload_waybar())
+        print(f"ClaudeBar is set up. It appears in the bar within one 30s poll.")
+    else:
+        print(f"ClaudeBar is already set up — nothing to do.")
+
+
+main()

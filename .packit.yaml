@@ -1,0 +1,20 @@
+# Packit-as-a-Service: https://packit.dev/docs/configuration
+# Every push to main builds a new package into COPR (alpharomercoma/claudebar);
+# pull requests get throwaway feedback builds.
+specfile_path: claudebar.spec
+# upstream (repo/archive) name differs from the package name on purpose
+upstream_package_name: claudebar-for-sway
+downstream_package_name: claudebar
+
+jobs:
+  - job: copr_build
+    trigger: commit
+    branch: main
+    owner: alpharomercoma
+    project: claudebar
+    # targets omitted: chroots come from the COPR project's own settings
+
+  - job: copr_build
+    trigger: pull_request
+    targets:
+      - fedora-all

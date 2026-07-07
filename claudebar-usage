@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+import json, os, subprocess, time, urllib.request, urllib.error
+from datetime import datetime
+
+CREDS = os.path.expanduser("~/.claude/.credentials.json")
+CACHE = os.path.expanduser("~/.cache/claudebar-usage.json")
+API_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+# Claude Code's public OAuth client id (same client that wrote .credentials.json).
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Anthropic's edge rejects urllib's default User-Agent, so identify as the CLI client.
+USER_AGENT = "claude-cli/oauth (claudebar-for-sway)"
+# Refresh a little before the token actually expires so we never serve a stale read.
+REFRESH_SKEW = 300  # seconds
+# Age after which cached data is visibly marked stale. One failed 30s poll is
+# tolerated; the second one crosses this line.
+STALE_AFTER = 60  # seconds
+GLYPH = "◆"
+SIGNIN_HINT = "Run `claude` in a terminal to sign in."
+MARKER_NAME = "claudebar-signin.notified"
+
+
+class SignedOut(Exception):
+    """Credentials are missing, unreadable, or rejected — the user must sign in."""
+
+
+def load_creds():
+    try:
+        with open(CREDS) as f:
+            data = json.load(f)
+        data["claudeAiOauth"]["accessToken"]  # presence check
+        return data
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SignedOut() from e
+
+
+def save_creds(data):
+    tmp = CREDS + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, CREDS)
+
+
+def refresh_token(data):
+    """Exchange the refresh token for a fresh access token and persist the
+    rotated credentials. Mirrors what Claude Code does on startup."""
+    o = data["claudeAiOauth"]
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": o["refreshToken"],
+        "client_id": CLIENT_ID,
+    }).encode()
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        resp = json.loads(r.read())
+    o["accessToken"] = resp["access_token"]
+    if resp.get("refresh_token"):
+        o["refreshToken"] = resp["refresh_token"]
+    if resp.get("expires_in"):
+        o["expiresAt"] = int((time.time() + resp["expires_in"]) * 1000)
+    save_creds(data)
+    return o["accessToken"]
+
+
+def get_token(data):
+    """Return a valid access token, refreshing first if it's expired or close
+    to expiring. Falls back to the existing token if refresh fails."""
+    o = data["claudeAiOauth"]
+    expires_at = o.get("expiresAt", 0) / 1000
+    if o.get("refreshToken") and time.time() >= expires_at - REFRESH_SKEW:
+        try:
+            return refresh_token(data)
+        except Exception:
+            pass  # fall back to whatever token we have; fetch may still work
+    return o["accessToken"]
+
+
+def fetch_usage(token):
+    req = urllib.request.Request(
+        API_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return json.loads(r.read())
+
+
+def fetch_usage_with_refresh(creds):
+    """Fetch usage; if the token is rejected (401), force one refresh and retry.
+    A refresh rejected outright, or a fresh token still rejected, means the
+    grant itself is dead — that's a sign-out, not a transient failure."""
+    try:
+        return fetch_usage(get_token(creds))
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        try:
+            token = refresh_token(load_creds())
+        except urllib.error.HTTPError as re:
+            if re.code in (400, 401, 403):
+                raise SignedOut() from re
+            raise
+        try:
+            return fetch_usage(token)
+        except urllib.error.HTTPError as e2:
+            if e2.code == 401:
+                raise SignedOut() from e2
+            raise
+
+
+def parse_resets_at(s):
+    """ISO timestamp → epoch seconds, 0 if unparsable."""
+    try:
+        return int(datetime.fromisoformat(s).timestamp())
+    except Exception:
+        return 0
+
+
+def fmt_span(seconds):
+    h, m = int(seconds // 3600), int((seconds % 3600) // 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def fmt_countdown(resets_at):
+    if not resets_at:
+        return "--"
+    remaining = resets_at - time.time()
+    return "↺" if remaining <= 0 else fmt_span(remaining)
+
+
+def load_cache():
+    try:
+        with open(CACHE) as f:
+            c = json.load(f)
+        # Old-format caches lack resets_at/fetched_at; .get() defaults below
+        # render them as immediately stale. Anything without a pct is garbage.
+        return c if c.get("pct") is not None else None
+    except Exception:
+        return None
+
+
+def save_cache(payload):
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    tmp = CACHE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, CACHE)
+
+
+def marker_path():
+    run_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if not run_dir or not os.path.isdir(run_dir):
+        return None  # headless/cron: no session to notify, no place to dedupe
+    return os.path.join(run_dir, MARKER_NAME)
+
+
+def maybe_notify_signed_out():
+    """Fire one desktop notification per login session ($XDG_RUNTIME_DIR is
+    wiped at logout). The marker is claimed before notifying so a crash can't
+    spam; every failure is swallowed to keep stdout a single JSON line."""
+    marker = marker_path()
+    if marker is None:
+        return
+    try:
+        with open(marker, "x"):
+            pass
+    except OSError:
+        return  # already notified this session (or unwritable — stay quiet)
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "claudebar", "-u", "normal",
+             "ClaudeBar: sign-in required",
+             "No Claude Code account detected. " + SIGNIN_HINT],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        pass
+
+
+def clear_signin_marker():
+    """A successful fetch proves we're signed in — let a future sign-out notify again."""
+    marker = marker_path()
+    if marker is not None:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+
+
+def emit(text, tooltip, css_class):
+    print(json.dumps({"text": text, "tooltip": tooltip, "class": css_class}))
+
+
+def render(c):
+    pct = c["pct"]
+    w7 = c.get("w7") or 0
+    time_str = fmt_countdown(c.get("resets_at") or 0)
+    css_class = "critical" if pct >= 80 else "active"
+    tooltip = f"5h window: {pct}% used, resets in {time_str}\n7d window: {w7}%"
+    fetched_at = c.get("fetched_at") or 0
+    age = max(0, time.time() - fetched_at)  # max() guards backward clock jumps
+    if age > STALE_AFTER:
+        ago = fmt_span(age) + " ago" if fetched_at else "unknown"
+        tooltip += f"\nstale: last updated {ago}"
+        css_class = [css_class, "stale"]
+    emit(f"{GLYPH} {pct}%  {time_str}", tooltip, css_class)
+
+
+def main():
+    try:
+        creds = load_creds()
+        data = fetch_usage_with_refresh(creds)
+        fh = data.get("five_hour") or {}
+        payload = {
+            "v": 2,
+            "pct": int(fh.get("utilization") or 0),
+            "w7": int((data.get("seven_day") or {}).get("utilization") or 0),
+            "resets_at": parse_resets_at(fh.get("resets_at") or ""),
+            "fetched_at": int(time.time()),
+        }
+        save_cache(payload)
+        clear_signin_marker()
+        render(payload)
+    except SignedOut:
+        maybe_notify_signed_out()
+        emit(f"{GLYPH} sign in", "Not signed in.\n" + SIGNIN_HINT, "signin")
+    except Exception:
+        c = load_cache()
+        if c is None:
+            emit(f"{GLYPH} --", "Waiting for data", "idle")
+        else:
+            render(c)
+
+
+main()

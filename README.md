@@ -17,6 +17,15 @@ A Waybar module that shows your real-time Claude Pro usage — 5-hour window per
 
 Hover for a tooltip that also shows your 7-day window usage.
 
+The module is always honest about what you're looking at:
+
+| Bar shows | Meaning |
+|---|---|
+| `◆ 27%  3h11m` | Live data (refreshed every 30 s; turns red at ≥ 80%) |
+| `◆ 27%  3h11m` *(stale)* | Network hiccup — last known data. The countdown keeps ticking, and after 60 s without a fresh fetch the tooltip says exactly when the data was last updated. The module also carries a `stale` CSS class, unstyled by default, if you want a visual cue |
+| `◆ sign in` | No account detected (signed out or credentials revoked) — you also get **one** desktop notification per session, never more |
+| `◆ --` | First run, no data yet |
+
 ---
 
 ## Requirements
@@ -28,30 +37,48 @@ Hover for a tooltip that also shows your 7-day window usage.
 
 ---
 
-## Setup
+## Install
 
-### 1. Copy the script
+### Via dnf (Fedora)
+
+```bash
+sudo dnf copr enable alpharomercoma/claudebar
+sudo dnf install claudebar
+claudebar-setup
+```
+
+That's it. `claudebar-setup` wires the module into your existing Waybar config and stylesheet (backing up anything it touches), then reloads Waybar. The module appears within one 30-second poll. Updates arrive with every `dnf upgrade`.
+
+### From a git clone
+
+```bash
+git clone https://github.com/alpharomercoma/claudebar-for-sway.git
+cd claudebar-for-sway
+./claudebar-setup
+```
+
+Same effect: the script is copied to `~/.config/waybar/scripts/`, your config and styles are patched (with backups), and Waybar is reloaded.
+
+`claudebar-setup` is safe to re-run — a second invocation changes nothing. If your Waybar config is exotic (multi-bar array config, unparsable), it refuses to touch it and prints the exact snippets to add by hand instead.
+
+### Manual setup (if you'd rather do it yourself)
+
+<details>
+<summary>Expand for the manual steps</summary>
+
+1. Copy the script:
 
 ```bash
 mkdir -p ~/.config/waybar/scripts
-cp claude-usage ~/.config/waybar/scripts/claude-usage
-chmod +x ~/.config/waybar/scripts/claude-usage
+cp claudebar-usage ~/.config/waybar/scripts/claudebar-usage
+chmod +x ~/.config/waybar/scripts/claudebar-usage
 ```
 
-### 2. Add the module to your Waybar config
-
-In `~/.config/waybar/config.jsonc`, add `"custom/claude"` to `modules-right` where you want it to appear, then add the module definition:
+2. In `~/.config/waybar/config.jsonc`, add `"custom/claude"` to `modules-right`, then add the module definition:
 
 ```jsonc
-"modules-right": [
-    "idle_inhibitor",
-    "custom/claude",
-    "pulseaudio",
-    // ... rest of your modules
-],
-
 "custom/claude": {
-    "exec": "$HOME/.config/waybar/scripts/claude-usage",
+    "exec": "$HOME/.config/waybar/scripts/claudebar-usage",
     "return-type": "json",
     "interval": 30,
     "format": "{}",
@@ -59,38 +86,15 @@ In `~/.config/waybar/config.jsonc`, add `"custom/claude"` to `modules-right` whe
 }
 ```
 
-If you don't have a `~/.config/waybar/config.jsonc` yet, copy the provided `config.jsonc` from this repo — it's based on the Fedora Sway default and has the module already placed left of the volume control.
+3. Append the module rules from this repo's `style.css` to your `~/.config/waybar/style.css` (the `#custom-claude` blocks, including `.idle`, `.critical`, and `.signin`).
 
-### 3. Add the styles
-
-Append the contents of `style.css` to your `~/.config/waybar/style.css`, or copy it wholesale if you don't have one yet.
-
-The relevant section:
-
-```css
-#custom-claude {
-    padding: 0 10px;
-    background-color: #2b303b;
-    color: #d97757;
-    border-left: 2px solid #d97757;
-}
-
-#custom-claude.idle {
-    color: #666e7a;
-    border-left-color: #666e7a;
-}
-
-#custom-claude.critical {
-    color: #eb4d4b;
-    border-left-color: #eb4d4b;
-}
-```
-
-### 4. Reload Waybar
+4. Reload Waybar:
 
 ```bash
 pkill -SIGUSR2 waybar
 ```
+
+</details>
 
 ---
 
@@ -104,7 +108,21 @@ Authorization: Bearer <token>
 anthropic-beta: oauth-2025-04-20
 ```
 
-The response contains `five_hour.utilization` (the percentage) and `five_hour.resets_at` (the reset timestamp). On network failure, the last successful result is served from `~/.cache/claudebar-usage.json` so the bar never flashes an error for a transient hiccup.
+The response contains `five_hour.utilization` (the percentage) and `five_hour.resets_at` (the reset timestamp).
+
+**Freshness.** Every successful fetch caches the raw values (`~/.cache/claudebar-usage.json`), including the reset timestamp and the fetch time. If a poll fails (offline, rate-limited, API down), the bar serves the cache — but the countdown is recomputed on every render so it keeps ticking, and after 60 seconds without a successful fetch the tooltip tells you exactly how old the data is. The module keeps its normal color; a `stale` CSS class is emitted alongside `active`/`critical` if you'd like to style staleness yourself. You can always trust what you see.
+
+**Sign-in detection.** Credential problems (missing file, revoked refresh token) are distinguished from network problems. When you're genuinely signed out, the bar shows `◆ sign in` and sends a single desktop notification per login session — it never nags. Once you sign in again, everything recovers automatically within one poll.
+
+---
+
+## Removing
+
+```bash
+sudo dnf remove claudebar   # rpm installs
+```
+
+Then, in either install mode: remove `"custom/claude"` from `modules-right` and the `"custom/claude"` block from your Waybar config, delete the `#custom-claude` rules from your `style.css`, and (git installs) delete `~/.config/waybar/scripts/claudebar-usage`.
 
 ---
 
@@ -124,14 +142,18 @@ Then start Waybar yourself via `exec waybar` in your sway config or a separate a
 
 ## Troubleshooting
 
-**Module shows `◆ --`**
-The script has no cached data yet and the API call failed. Check that `~/.claude/.credentials.json` exists and that you're connected to the internet. Run the script directly to see the error:
-```bash
-python3 ~/.config/waybar/scripts/claude-usage
-```
+**Module shows `◆ sign in`**
+No usable Claude Code account was found — the credentials file is missing, unreadable, or its refresh token was revoked (e.g. you signed out). Run `claude` once to re-authenticate; the bar recovers within one 30-second poll.
 
-**Token expired**
-The script refreshes the access token on its own whenever it's expired or about to expire, so this should resolve automatically within one 30-second poll. If it persists, your `refreshToken` may be invalid (e.g. you signed out) — run `claude` once to re-authenticate, which rewrites `~/.claude/.credentials.json`.
+**Tooltip says the data is stale**
+The last poll(s) failed — usually a network hiccup or a transient API error. Nothing to do; it recovers on the next successful poll. The tooltip shows how old the displayed data is.
+
+**Module shows `◆ --`**
+No cached data yet and the API call failed. Check your connection, then run the script directly to see what's happening:
+```bash
+~/.config/waybar/scripts/claudebar-usage    # git installs
+claudebar-usage                              # rpm installs
+```
 
 **Waybar not picking up changes**
 ```bash
@@ -141,3 +163,15 @@ If that doesn't work, kill and restart it:
 ```bash
 pkill waybar && waybar &
 ```
+
+---
+
+## CodexBar
+
+Also want your Codex (ChatGPT) usage next to this? See the companion module: [CodexBar for Sway](https://github.com/alpharomercoma/codexbar-for-sway). Both setup tools compose cleanly in the same Waybar config.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).

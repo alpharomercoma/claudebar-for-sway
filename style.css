@@ -215,3 +215,13 @@ label:focus {
     color: #666e7a;
     border-left-color: #666e7a;
 }
+
+#custom-claude.critical {
+    color: #eb4d4b;
+    border-left-color: #eb4d4b;
+}
+
+#custom-claude.signin {
+    color: #f1c40f;
+    border-left-color: #f1c40f;
+}

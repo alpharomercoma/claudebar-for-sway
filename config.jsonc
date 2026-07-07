@@ -115,7 +115,7 @@
         "on-click": "pavucontrol"
     },
     "custom/claude": {
-        "exec": "$HOME/.config/waybar/scripts/claude-usage",
+        "exec": "$HOME/.config/waybar/scripts/claudebar-usage",
         "return-type": "json",
         "interval": 30,
         "format": "{}",
