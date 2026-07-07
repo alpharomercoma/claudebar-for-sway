@@ -6,6 +6,11 @@ specfile_path: claudebar.spec
 upstream_package_name: claudebar-for-sway
 downstream_package_name: claudebar
 
+actions:
+  # Tags are vX.Y.Z; strip the v so the RPM Version is X.Y.Z, not vX.Y.Z.
+  get-current-version:
+    - bash -c "git describe --tags --abbrev=0 | sed 's/^v//'"
+
 jobs:
   - job: copr_build
     trigger: commit
